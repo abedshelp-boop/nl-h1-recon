@@ -1,4 +1,3 @@
 [build]
-  command = "true"
+  command = "bash recon.sh"
   publish = "public"
-  functions = "netlify/functions"
